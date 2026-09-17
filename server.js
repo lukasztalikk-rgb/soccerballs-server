@@ -16,9 +16,24 @@ let waiting = null;
 const rooms = {};
 let nextRoom = 1;
 
+/* A socket can sit in readyState OPEN long after the peer is gone, because the
+   OS has not timed the TCP connection out yet. Pairing someone with such a
+   zombie hands them a match that will never start, so require recent proof of
+   life: a pong (every 30s) or any client message. */
+const LIVENESS_MS = 45000;
+const isLive = s =>
+  s && s.readyState === s.OPEN && Date.now() - (s.lastSeen || 0) < LIVENESS_MS;
+
 wss.on('connection', ws => {
   ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
+  ws.lastSeen = Date.now();
+  ws.on('pong', () => { ws.isAlive = true; ws.lastSeen = Date.now(); });
+
+  if (waiting && !isLive(waiting) && waiting !== ws) {
+    /* stale straggler still occupying the queue — drop it */
+    try { waiting.terminate(); } catch (e) {}
+    waiting = null;
+  }
 
   if (waiting && waiting.readyState === waiting.OPEN) {
     /* pair up */
@@ -38,6 +53,7 @@ wss.on('connection', ws => {
   }
 
   ws.on('message', (raw, isBinary) => {
+    ws.lastSeen = Date.now();   /* also counts as proof of life while queuing */
     const room = rooms[ws.rid];
     if (!room) return;
     const other = ws.role === 'p1' ? room.p2 : room.p1;
