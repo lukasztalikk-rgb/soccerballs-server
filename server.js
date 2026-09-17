@@ -37,11 +37,14 @@ wss.on('connection', ws => {
     ws.send(JSON.stringify({ type: 'waiting' }));
   }
 
-  ws.on('message', raw => {
+  ws.on('message', (raw, isBinary) => {
     const room = rooms[ws.rid];
     if (!room) return;
     const other = ws.role === 'p1' ? room.p2 : room.p1;
-    if (other && other.readyState === other.OPEN) other.send(raw);
+    if (!other || other.readyState !== other.OPEN) return;
+    /* ws v8 always hands us a Buffer; relaying it as-is would send a binary
+       frame, which reaches the browser as a Blob and breaks JSON.parse */
+    other.send(isBinary ? raw : raw.toString());
   });
 
   ws.on('close', () => {
