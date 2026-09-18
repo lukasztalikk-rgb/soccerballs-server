@@ -12,7 +12,8 @@ const httpServer = http.createServer((req, res) => {
 /* ── WebSocket server ── */
 const wss = new WebSocketServer({ server: httpServer });
 
-let waiting = null;
+let waiting = null;          /* quick-match queue: one slot */
+const codeWaiting = {};      /* private rooms: code -> the socket waiting there */
 const rooms = {};
 let nextRoom = 1;
 
@@ -24,47 +25,85 @@ const LIVENESS_MS = 45000;
 const isLive = s =>
   s && s.readyState === s.OPEN && Date.now() - (s.lastSeen || 0) < LIVENESS_MS;
 
+function pair(a, b, code) {
+  const rid = nextRoom++;
+  rooms[rid] = { id: rid, p1: a, p2: b };
+  a.rid = rid; a.role = 'p1';
+  b.rid = rid; b.role = 'p2';
+  a.send(JSON.stringify({ type: 'matched', role: 'p1', roomId: rid, code: code || null }));
+  b.send(JSON.stringify({ type: 'matched', role: 'p2', roomId: rid, code: code || null }));
+}
+
+function cleanCode(v) {
+  return String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+}
+
+/* Quick match: pair with whoever is waiting, else become the one waiting. */
+function joinQuick(ws) {
+  if (waiting && waiting !== ws && !isLive(waiting)) {
+    try { waiting.terminate(); } catch (e) {}
+    waiting = null;
+  }
+  if (waiting && waiting !== ws && waiting.readyState === waiting.OPEN) {
+    const w = waiting; waiting = null;
+    pair(w, ws, null);
+  } else {
+    waiting = ws;
+    ws.send(JSON.stringify({ type: 'waiting' }));
+  }
+}
+
+/* Private room: the first to name a code waits there, the second joins them.
+   No queue, no bot fallback on the client — you are waiting for a friend. */
+function joinCode(ws, code) {
+  const w = codeWaiting[code];
+  if (w && w !== ws && isLive(w)) {
+    delete codeWaiting[code];
+    pair(w, ws, code);
+    return;
+  }
+  if (w && w !== ws) { try { w.terminate(); } catch (e) {} }
+  codeWaiting[code] = ws;
+  ws.code = code;
+  ws.send(JSON.stringify({ type: 'waiting', code }));
+}
+
 wss.on('connection', ws => {
   ws.isAlive = true;
   ws.lastSeen = Date.now();
   ws.on('pong', () => { ws.isAlive = true; ws.lastSeen = Date.now(); });
 
-  if (waiting && !isLive(waiting) && waiting !== ws) {
-    /* stale straggler still occupying the queue — drop it */
-    try { waiting.terminate(); } catch (e) {}
-    waiting = null;
-  }
-
-  if (waiting && waiting.readyState === waiting.OPEN) {
-    /* pair up */
-    const rid = nextRoom++;
-    const room = { id: rid, p1: waiting, p2: ws };
-    rooms[rid] = room;
-
-    waiting.rid  = rid; waiting.role  = 'p1';
-    ws.rid       = rid; ws.role       = 'p2';
-
-    waiting.send(JSON.stringify({ type: 'matched', role: 'p1', roomId: rid }));
-    ws.send(JSON.stringify({ type: 'matched', role: 'p2', roomId: rid }));
-    waiting = null;
-  } else {
-    waiting = ws;
-    ws.send(JSON.stringify({ type: 'waiting' }));
-  }
+  /* Clients announce what they want first. Old clients never do, so after a
+     short grace they are treated as quick-match, exactly as before. */
+  ws.helloTimer = setTimeout(() => {
+    if (!ws.rid && !ws.hello && ws.readyState === ws.OPEN) { ws.hello = true; joinQuick(ws); }
+  }, 1500);
 
   ws.on('message', (raw, isBinary) => {
     ws.lastSeen = Date.now();   /* also counts as proof of life while queuing */
     const room = rooms[ws.rid];
-    if (!room) return;
-    const other = ws.role === 'p1' ? room.p2 : room.p1;
-    if (!other || other.readyState !== other.OPEN) return;
-    /* ws v8 always hands us a Buffer; relaying it as-is would send a binary
-       frame, which reaches the browser as a Blob and breaks JSON.parse */
-    other.send(isBinary ? raw : raw.toString());
+    if (room) {
+      const other = ws.role === 'p1' ? room.p2 : room.p1;
+      if (!other || other.readyState !== other.OPEN) return;
+      /* ws v8 always hands us a Buffer; relaying it as-is would send a binary
+         frame, which reaches the browser as a Blob and breaks JSON.parse */
+      other.send(isBinary ? raw : raw.toString());
+      return;
+    }
+    if (ws.hello) return;   /* already queued, nothing to relay yet */
+    let msg = null;
+    try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
+    if (!msg || msg.type !== 'hello') return;
+    clearTimeout(ws.helloTimer);
+    ws.hello = true;
+    const code = msg.mode === 'code' ? cleanCode(msg.code) : '';
+    if (code) joinCode(ws, code); else joinQuick(ws);
   });
 
   ws.on('close', () => {
+    clearTimeout(ws.helloTimer);
     if (waiting === ws) { waiting = null; return; }
+    if (ws.code && codeWaiting[ws.code] === ws) { delete codeWaiting[ws.code]; return; }
     const room = rooms[ws.rid];
     if (!room) return;
     const other = ws.role === 'p1' ? room.p2 : room.p1;
